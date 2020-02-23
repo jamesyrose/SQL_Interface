@@ -15,11 +15,38 @@ with over 12K symbols.
 """
 
 import os
+import logging
 import pandas as pd
 import numpy as np
 import sqlalchemy as sa
 from sqlalchemy import create_engine
-from config import sql_user, sql_pass
+from datetime import datetime
+_script_path = os.path.realpath(__file__)
+_script_dir = os.path.dirname(_script_path)
+_log_path = os.path.join(_script_dir, ".logs", __file__.replace(".py", ".log"))
+
+
+def getLogger(log_file, level=logging.INFO):
+    """
+    Stream Logger + File Log
+
+    :param log_file:  Path to log file
+    :param level: logging level
+    :return:  logger
+    """
+    name = "new_logger"
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+    stream = logging.StreamHandler()
+    stream.setFormatter(formatter)
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(formatter)
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.addHandler(handler)
+    logger.addHandler(stream)
+    return logger
+
 
 class SQL(object):
     def __init__(self, database):
@@ -28,7 +55,7 @@ class SQL(object):
                                                                                      database
                                                                                     )
                                    )
-
+        self.logger = getLogger(log_file=_log_path)
     @property
     def show_tables(self):
         """
@@ -39,6 +66,17 @@ class SQL(object):
         """
         tables = pd.read_sql(con=self.engine, sql="show tables;")
         return tables[tables.columns[0]].to_list()
+
+    @property
+    def symbols_avaliable(self):
+        """
+        Shows the symbols that are available
+
+        converts show_tables to dict, select keys, convert to dict
+        :return:  list
+        """
+        return list(dict.fromkeys([symbol.split("_")[0] for symbol in self.show_tables]))
+
 
     def create_table_ohlc(self, table_name):
         """
@@ -146,6 +184,83 @@ class SQL(object):
                                         )
             self.pandas_upload(data=df.reset_index(drop=True),
                                table_name=table_name)
+    def query_one_symbol(self, symbol=str, start_date=[datetime, str], end_date=[datetime, str], datetime_format=None
+                         ) -> pd.DataFrame:
+        """
+        Queries SQL for Data
 
+        Takes user input of ticker symbol and date range and queries database.
+        Query is split up by years to  minimize the datetime search. 
+        Converts the OHLC values back to original (decimal) format
+
+        EX SQL Command:
+        SELECT CAST(Open AS DECIMAL) / 10000 AS Open, Close
+        FROM (SELECT * FROM {symbol}_2018
+              UNION
+              SELECT * FROM {symbol}_2019 WHERE Datetime BETWEEN '2018-01-01' and '2019-05-05') x
+        ORDER BY x.Datetime
+
+        :param symbol: Ticker Symbol
+        :param start_date: Begining of Date Range
+        :param end_date:  End of Data Range
+        :param datetime_format: datetime format if string dates are passed
+        :return:
+        """
+        # Converting string to datetime if needed
+        if isinstance(start_date, str) and datetime_format is not None:
+            try:
+                start_date = datetime.strptime(start_date, datetime_format)
+            except ValueError:
+                raise(self.logger.error('Start Date Not Formatted Properly'))
+        elif isinstance(start_date, str) and datetime_format is None:
+            raise(self.logger.error('Datetime format not provided'))
+        if isinstance(end_date, str) and datetime_format is not None:
+            try:
+                end_date = datetime.strptime(end_date, datetime_format)
+            except ValueError:
+                raise(self.logger.error('End Date Not Formatted Properly'))
+        elif isinstance(end_date, str) and datetime_format is None:
+            raise(self.logger.error('Datetime format not provided'))
+        # building an SQL command
+        start_year = start_date.year
+        end_year = end_date.year
+        # Splitting by dates to minimize the datetime between search
+        # Starting Year
+        sql_str = "SELECT Datetime, Open, Close, High, Low, Volume " \
+                  "FROM {}_{} " \
+                  "WHERE Datetime BETWEEN '{}' AND'{}'".format(symbol,
+                                                               start_year,
+                                                               start_date,
+                                                               end_date
+                                                               )
+        # Inbetween years (we know we will use the whole year
+        for full_year in range(start_year+1, end_year):
+            sql_str = "{} UNION " \
+                      "SELECT Datetime, Open, Close, High, Low, Volume " \
+                      "FROM {}_{}".format(sql_str,
+                                          symbol,
+                                          full_year
+                                          )
+        # Ending Year
+        sql_str = "{} UNION " \
+                  "SELECT Datetime, Open, Close, High, Low, Volume " \
+                  "FROM {}_{} " \
+                  "WHERE Datetime BETWEEN '{}' AND '{}'".format(sql_str,
+                                                                symbol,
+                                                                end_year,
+                                                                start_date,
+                                                                end_date
+                                                                )
+        # Converting OHLC back to decimals
+        final_sql_str = "SELECT " \
+                        "    Datetime, "\
+                        "    CAST(Open AS DECIMAL) / 10000 as Open, " \
+                        "    CAST(Close AS DECIMAL) / 10000 as Close, " \
+                        "    CAST(High AS DECIMAL) / 10000 as High, " \
+                        "    CAST(Low AS DECIMAL) / 10000 as Low, " \
+                        "    Volume " \
+                        "FROM ({}) X " \
+                        "ORDER BY X.Datetime".format(sql_str)
+        return self.query_sql(sql_str=final_sql_str)
 
 
